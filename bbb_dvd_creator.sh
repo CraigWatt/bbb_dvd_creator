@@ -4,11 +4,17 @@
 # Purpose: Automate splitting a video into segments, grouping them, creating a DVD structure
 #          with specified VOB files, and testing with dvdnavtex.
 # Usage: ./bbb_dvd_creator.sh [-q] [input_video.mp4]
-# Example: ./bbb_dvd_creator.sh -q bbb_sunflower_1080p_30fps_normal.mp4
+# Example: ./bbb_dvd_creator.sh bbb_sunflower_1080p_30fps_normal_transcoded.mp4
 
 # Initialize variables
 QUIET_MODE="false"
-DEBUG_MODE="true"  # Set to "true" to enable debug outputs
+DEBUG_MODE="false"  # Set to "true" to enable debug outputs
+
+# Arrays to track intermediate files
+SEGMENT_FILES=()
+GROUPED_FILES=()
+CONCAT_FILES=()
+FFMPEG_LOGS=("ffmpeg_group01_pass.log" "ffmpeg_group02_pass.log" "ffmpeg_group03_pass.log")
 
 # Function to display usage
 usage() {
@@ -20,11 +26,41 @@ usage() {
 # Function to perform cleanup
 cleanup() {
   if [[ "$QUIET_MODE" == "true" ]]; then
-    echo "Deleting intermediate MPEG files..."
-    rm -f "${MPEG_FILES[@]}"
+    if [[ "$ALL_FILES_EXIST" != true ]]; then
+      echo "An error occurred. Retaining ffmpeg log files for troubleshooting."
+    else
+      echo "Deleting intermediate MPEG files..."
+      # Delete grouped MPEG files
+      for file in "${GROUPED_FILES[@]}"; do
+        rm -f "$file"
+      done
+      
+      # Delete segment files
+      echo "Deleting segment files..."
+      for seg in "${SEGMENT_FILES[@]}"; do
+        rm -f "$seg"
+      done
+      
+      # Delete concatenation list files
+      echo "Deleting concatenation list files..."
+      for concat in "${CONCAT_FILES[@]}"; do
+        rm -f "$concat"
+      done
+      
+      # Delete ffmpeg logs
+      echo "Deleting ffmpeg log files..."
+      for log in "${FFMPEG_LOGS[@]}"; do
+        rm -f "$log"
+      done
+  
+      # Delete global ffmpeg two-pass logs
+      echo "Deleting global ffmpeg two-pass log files..."
+      rm -f ffmpeg2pass-0.log ffmpeg2pass-0.log.mbtree
+    fi
   fi
   echo "Script execution completed."
 }
+
 
 # Trap EXIT to ensure cleanup is called
 trap cleanup EXIT
@@ -77,7 +113,7 @@ fi
 
 # Define the segment distribution
 SEGMENTS_TOTAL=9
-VOB_SEGMENTS=(1 2 6)  # Number of segments per VOB file
+VOB_SEGMENTS=(3 3 3)  # Number of segments per VOB file
 
 # Validate total segments
 TOTAL_VOB_SEGMENTS=0
@@ -110,9 +146,6 @@ if [[ "$DEBUG_MODE" == "true" ]]; then
   echo "SEGMENT_DURATION: $SEGMENT_DURATION seconds"
 fi
 
-# Create an array to hold individual segment filenames
-SEGMENT_FILES=()
-
 # Split the video into segments
 echo "Splitting the video into segments..."
 for ((i = 0; i < SEGMENTS_TOTAL; i++)); do
@@ -120,7 +153,14 @@ for ((i = 0; i < SEGMENTS_TOTAL; i++)); do
   SEGMENT_NUM=$((i + 1))
   SEGMENT_FILE="segment$(printf "%02d" "$SEGMENT_NUM").mp4"
   echo "Creating segment $SEGMENT_NUM: $SEGMENT_FILE (Start: ${START_TIME}s, Duration: ${SEGMENT_DURATION}s)"
-  ffmpeg -v quiet -y -i "$INPUT_VIDEO" -ss "$START_TIME" -t "$SEGMENT_DURATION" -c copy "$SEGMENT_FILE"
+  
+  # Re-encode each segment to ensure consistent timestamps and encoding
+  ffmpeg -v quiet -y -i "$INPUT_VIDEO" -ss "$START_TIME" -t "$SEGMENT_DURATION" \
+    -c:v mpeg2video -b:v 1500k -maxrate 1800k -bufsize 2100k -g 10 -r 30 \
+    -s 352x240 \
+    -c:a ac3 -b:a 128k -ac 2 -ar 48000 \
+    "$SEGMENT_FILE"
+  
   if [ $? -ne 0 ]; then
     echo "Error: Failed to create segment $SEGMENT_NUM."
     exit 1
@@ -133,91 +173,61 @@ if [[ "$DEBUG_MODE" == "true" ]]; then
 fi
 
 # Group the segments according to VOB_SEGMENTS
-GROUPED_FILES=()
-INDEX=0
 echo "Grouping segments..."
 for ((group = 0; group < ${#VOB_SEGMENTS[@]}; group++)); do
   NUM_SEGMENTS=${VOB_SEGMENTS[$group]}
-  GROUP_NUM=$((group + 1))
-  GROUP_FILE="group$(printf "%02d" "$GROUP_NUM").mp4"
+  GROUP_INT=$((group + 1))
+  GROUP_NUM=$(printf "%02d" "$GROUP_INT")
+  GROUP_FILE="group${GROUP_NUM}.mpg"
   echo "Creating $GROUP_FILE by merging ${NUM_SEGMENTS} segments."
-  
+
   # Collect segment files for this group
   GROUP_SEGMENTS=()
   for ((s = 0; s < NUM_SEGMENTS; s++)); do
-    GROUP_SEGMENTS+=("${SEGMENT_FILES[$INDEX]}")
-    INDEX=$((INDEX + 1))
+    GROUP_SEGMENTS+=("${SEGMENT_FILES[0]}")
+    SEGMENT_FILES=("${SEGMENT_FILES[@]:1}")  # Remove the first element
   done
-  
+
   if [[ "$DEBUG_MODE" == "true" ]]; then
     echo "Group $GROUP_NUM segments: ${GROUP_SEGMENTS[*]}"
   fi
-  
-  # Merge segments using ffmpeg concat demuxer and re-encode audio to fix discontinuities
-  CONCAT_FILE="concat_list_group$(printf "%02d" "$GROUP_NUM").txt"
-  rm -f "$CONCAT_FILE"
+
+  # Create concat list file
+  CONCAT_FILE="concat_list_group${GROUP_NUM}.txt"
+  echo "" > "$CONCAT_FILE"  # Truncate the file
   for SEG in "${GROUP_SEGMENTS[@]}"; do
     echo "file '$SEG'" >> "$CONCAT_FILE"
   done
-  ffmpeg -v quiet -y -f concat -safe 0 -i "$CONCAT_FILE" -c:v copy -c:a aac -b:a 192k "$GROUP_FILE"
+  CONCAT_FILES+=("$CONCAT_FILE")
+
+  # Two-Pass Encoding to MPEG-2 with Corrected Bitrate Settings and Proper Format
+  ffmpeg -y -f concat -safe 0 -i "$CONCAT_FILE" \
+    -target ntsc-dvd \
+    "$GROUP_FILE" 2>> ffmpeg_group${GROUP_NUM}_pass.log
+
+  # Check if encoding was successful
   if [ $? -ne 0 ]; then
-    echo "Error: Failed to create grouped file $GROUP_FILE."
+    echo "Error: Failed to convert group${GROUP_NUM}.mpg to MPEG format."
+    echo "Encoding Log:"
+    cat ffmpeg_group${GROUP_NUM}_pass.log
     exit 1
   fi
   GROUPED_FILES+=("$GROUP_FILE")
-  
-  # Remove intermediate segment files if quiet mode is enabled
-  if [[ "$QUIET_MODE" == "true" ]]; then
-    echo "Deleting intermediate segment files for group$(printf "%02d" "$GROUP_NUM")..."
-    rm -f "${GROUP_SEGMENTS[@]}"
-    rm -f "$CONCAT_FILE"
-  else
-    # Remove concat list file
-    rm -f "$CONCAT_FILE"
-  fi
-done
 
-if [[ "$DEBUG_MODE" == "true" ]]; then
-  echo "Grouped files created: ${GROUPED_FILES[*]}"
-fi
-
-# Convert grouped files to DVD-compatible MPEG-2 format
-MPEG_FILES=()
-echo "Converting grouped files to DVD-compatible MPEG-2 format..."
-for GROUP_FILE in "${GROUPED_FILES[@]}"; do
-  # Extract GROUP_NUM from GROUP_FILE
-  BASENAME=$(basename "$GROUP_FILE" .mp4)
-  GROUP_NUM=${BASENAME#group}
-  if [[ "$DEBUG_MODE" == "true" ]]; then
-    echo "Processing $GROUP_FILE, GROUP_NUM: $GROUP_NUM"
-  fi
-  
-  MPEG_FILE="group$(printf "%02d" "$GROUP_NUM").mpg"
-  echo "Converting $GROUP_FILE to $MPEG_FILE"
-  ffmpeg -v quiet -y -i "$GROUP_FILE" \
-    -target ntsc-dvd \
-    -aspect 16:9 \
-    -vf scale=720:480 \
-    -r 29.97 \
-    -b:v 6000k \
-    -b:a 192k \
-    -ac 2 \
-    "$MPEG_FILE"
-  if [ $? -ne 0 ]; then
-    echo "Error: Failed to convert $GROUP_FILE to MPEG format."
-    exit 1
-  fi
-  MPEG_FILES+=("$MPEG_FILE")
-  
   # Remove grouped .mp4 files if quiet mode is enabled
   if [[ "$QUIET_MODE" == "true" ]]; then
-    echo "Deleting grouped file $GROUP_FILE..."
-    rm -f "$GROUP_FILE"
+    echo "Deleting grouped .mp4 files for group${GROUP_NUM}..."
+    for SEG in "${GROUP_SEGMENTS[@]}"; do
+      rm -f "$SEG"
+    done
   fi
+
+  # Remove concat list file
+  rm -f "$CONCAT_FILE"
 done
 
 if [[ "$DEBUG_MODE" == "true" ]]; then
-  echo "MPEG files created: ${MPEG_FILES[*]}"
+  echo "Grouped MPEG files created: ${GROUPED_FILES[*]}"
 fi
 
 # **Set the VIDEO_FORMAT environment variable**
@@ -227,8 +237,9 @@ export VIDEO_FORMAT=NTSC
 DVD_DIR="custom_dvd"
 echo "Creating DVD structure in $DVD_DIR..."
 mkdir -p "$DVD_DIR"
+mkdir -p "$DVD_DIR/VIDEO_TS"
 
-for MPEG_FILE in "${MPEG_FILES[@]}"; do
+for MPEG_FILE in "${GROUPED_FILES[@]}"; do
   echo "Adding $MPEG_FILE to DVD titleset"
   dvdauthor -o "$DVD_DIR" -t "$MPEG_FILE"
   if [ $? -ne 0 ]; then
