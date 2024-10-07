@@ -2,3 +2,6 @@
 *.mp4
 *.mpg
 /custom_dvd
+
+# But do NOT ignore bbb_sunflower_1080p_30fps_normal_transcoded.mp4
+!bbb_sunflower_1080p_30fps_normal_transcoded.mp4
